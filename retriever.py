@@ -88,7 +88,18 @@ def search_decisions(dava_turu: str = "", keyword: str = "", limit: int = 15) ->
         if len(results) >= limit:
             break
 
-    return {"toplam_eslesen": len(results), "kararlar": results} # Tüm eşleşen kararlar sonuç olarak döndürülür.
+    if not results:
+        return {
+            "toplam_eslesen": 0,
+            "kararlar": [],
+            "uyari": (
+                "Veri tabanında bu sorguya uygun karar bulunamadi. "
+                "Bu veri tabani yalnizca Asliye Ticaret Mahkemesi kararlarini icermektedir. "
+                "Aile hukuku, ceza veya idare davalarına ait karar bulunmamaktadir. "
+                "Kullaniciya nazikce bilgi ver, uydurmа yanıt verme."
+            ),
+        }
+    return {"toplam_eslesen": len(results), "kararlar": results}
 
 
 # ── Araç 3 ────────────────────────────────────────────────────────────────────

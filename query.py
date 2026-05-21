@@ -80,10 +80,8 @@ def run_query(question: str, verbose: bool = True) -> str:
         if not tool_calls:
             return msg.get("content", "")
 
-        # Assistant mesajını geçmişe ekle
-        messages.append({"role": "assistant", "content": msg.get("content") or "", "tool_calls": tool_calls})
-
-        # Her tool çağrısını çalıştır
+        # Modelin birden fazla tool çağırmasını engelle: sadece ilk geçerliyi al
+        valid_tc = None
         for tc in tool_calls:
             fn   = tc.get("function", {})
             name = fn.get("name", "")
@@ -93,18 +91,44 @@ def run_query(question: str, verbose: bool = True) -> str:
                     args = json.loads(args)
                 except Exception:
                     args = {}
+            # Placeholder içeren çağrıları atla
+            args_str = json.dumps(args)
+            if "<doc_id>" in args_str or "<section>" in args_str:
+                if verbose:
+                    print(f"  !! ATLANDI (placeholder): {name}({args_str[:80]})")
+                continue
+            # Zorunlu parametre eksikse atla
+            if name == "get_decision_structure" and not args.get("doc_id"):
+                if verbose:
+                    print(f"  !! ATLANDI (eksik doc_id): {name}")
+                continue
+            if name == "get_section" and (not args.get("doc_id") or not args.get("section")):
+                if verbose:
+                    print(f"  !! ATLANDI (eksik parametre): {name}")
+                continue
+            valid_tc = (tc, name, args)
+            break  # Sadece ilk geçerli tool çağrısını işle
 
-            if verbose:
-                args_str = json.dumps(args, ensure_ascii=True)[:100]
-                print(f"  -> {name}({args_str})")
+        if valid_tc is None:
+            # Hiç geçerli tool yoksa modelden düz yanıt iste
+            messages.append({"role": "assistant", "content": msg.get("content") or ""})
+            messages.append({"role": "user", "content": "Elindeki bilgilerle Türkçe özet yanıt ver."})
+            continue
 
-            result = dispatch(name, args) # retriever.py'deki dispatch fonksiyonu tool çağrısına göre ilgili fonksiyonu çalıştırır ve sonucu döner.
+        tc, name, args = valid_tc
 
-            #Burada llm'e tool çağrısının sonucunu "tool" rolüyle geri veriyoruz, böylece llm yeni bilgiyi görüp sonraki adımları ona göre planlayabilir.
-            messages.append({
-                "role":    "tool",
-                "content": json.dumps(result, ensure_ascii=False),
-            })
+        # Assistant mesajını geçmişe ekle (sadece geçerli 1 tool ile)
+        messages.append({"role": "assistant", "content": msg.get("content") or "", "tool_calls": [tc]})
+
+        if verbose:
+            print(f"  -> {name}({json.dumps(args, ensure_ascii=True)[:100]})")
+
+        result = dispatch(name, args)
+
+        messages.append({
+            "role":    "tool",
+            "content": json.dumps(result, ensure_ascii=False),
+        })
 
     return "Maksimum tur sayisina ulasildi."
 
