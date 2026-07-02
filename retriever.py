@@ -46,6 +46,7 @@ def search_decisions(dava_turu: str = "", keyword: str = "", limit: int = 15) ->
     Dava türü veya anahtar kelimeye göre karar listesi döndürür (max 15 sonuç).
     """
     idx = _load_index()
+    limit = int(limit)  # LLM bazen sayıyı string olarak gönderiyor ("15")
     # dava_turu gerçekten index'te var mı kontrol et; yoksa yoksay
     if dava_turu:
         turu_var = any(dava_turu.lower() in k.lower() for k in idx["by_dava_turu"])

@@ -15,14 +15,15 @@ from retriever import TOOLS, dispatch # TOOLS LLM'e verilecek tool tanımları, 
 # Ollama local API endpointi ve model adı
 OLLAMA_URL = "http://localhost:11434/api/chat"
 MODEL      = "llama3.1:8b"
-MAX_ROUNDS = 6
+MAX_ROUNDS = 8
 
 SYSTEM = """Sen bir Turk hukuku asistanisin. Elinde mahkeme kararlarindan olusan bir veri tabani var.
 
 ZORUNLU SIRALAMA:
 1. get_master_index() -> mevcut dava turlerini ve adedi gor.
-2. Eger sorguda gecen kelime (zimmet, bosanma, tazminat vb.) dava_turu_ve_adet listesinde AYNEN varsa: search_decisions(dava_turu="<listedeki deger>") cagir.
-   Eger AYNEN yoksa: search_decisions(dava_turu="", keyword="<arama kelimesi>") cagir. dava_turu'nu uydurma.
+2. Kullanicinin sorusundaki konuyla ilgili kelimeyi dava_turu_ve_adet listesinde ara. AYNEN eslesen bir deger varsa:
+   search_decisions(dava_turu="<listedeki deger>") cagir. Eslesen deger yoksa: search_decisions(dava_turu="", keyword="<sorudaki konuyla ilgili gercek kelime>") cagir.
+   Ornek kelimeleri (zimmet, bosanma vb.) asla dogrudan kullanma, sadece kullanicinin GERCEK sorusundaki kelimeleri kullan. dava_turu'nu uydurma.
 3. Sonuclari goren doc_id'ler icin get_decision_structure() cagir.
 4. get_section() ile sadece gerekli bolumu getir.
 5. Kullaniciya Turkce ozet yanit ver.
@@ -44,6 +45,23 @@ def _to_ollama_tools(tools: list) -> list:
         })
     return result
 
+# PageIndex zincirinin zorunlu sırası. Model bu sırayı atlayıp erken cevap veremesin diye
+# her turda hangi tool'un çağrılabileceğini biz belirliyoruz (Ollama'nın tool_choice'una güvenmek
+# yeterli değil - serbest bırakılınca model 2. turda hiç tool çağırmadan halüsinasyon üretiyordu).
+def _required_tool(state: dict) -> str | None:
+    if not state["master_done"]:
+        return "get_master_index"
+    if not state["search_done"]:
+        return "search_decisions"
+    if state["search_empty"]:
+        return None  # eşleşme yok, modelin uyarıyı ilettiği serbest cevaba izin ver
+    if not state["structure_done"]:
+        return "get_decision_structure"
+    if not state["section_done"]:
+        return "get_section"
+    return None  # zincir tamamlandı, artık serbest cevaba izin ver
+
+
 # Bu sistemin llm agent sistemiyle nasıl çalıştığına dair temel akış:
 def run_query(question: str, verbose: bool = True) -> str:
     messages = [
@@ -52,8 +70,18 @@ def run_query(question: str, verbose: bool = True) -> str:
     ]
     ollama_tools = _to_ollama_tools(TOOLS) # LLM'e TOOL setini verdik
 
+    state = {
+        "master_done": False,
+        "search_done": False,
+        "search_empty": False,
+        "structure_done": False,
+        "section_done": False,
+    }
+
     # Bu döngü agent sistem döngüsü gibi düşünülebilir burada metodları çağırır ve sonuçları LLM'e geri veririz.
     for round_num in range(MAX_ROUNDS):
+        required_tool = _required_tool(state)
+
         #Ollama API request body.
         payload = {
             "model":    MODEL,
@@ -61,12 +89,15 @@ def run_query(question: str, verbose: bool = True) -> str:
             "tools":    ollama_tools,
             "stream":   False,
         }
-        # İlk turda get_master_index'i zorunlu kıl - İLK ADIMDA SADECE BU TOOL'U KULLAN
-        if round_num == 0:
+        if required_tool:
             payload["tool_choice"] = {
                 "type": "function",
-                "function": {"name": "get_master_index"}
+                "function": {"name": required_tool}
             }
+
+        if verbose:
+            print(f"\n[Tur {round_num + 1}] zorunlu_tool={required_tool or '(serbest)'}")
+
         resp = requests.post(OLLAMA_URL, json=payload, timeout=300)
         resp.raise_for_status()
         data = resp.json()
@@ -75,12 +106,24 @@ def run_query(question: str, verbose: bool = True) -> str:
         tool_calls = msg.get("tool_calls", [])
 
         if verbose:
-            print(f"\n[Tur {round_num + 1}] tool_calls={len(tool_calls)}")
+            print(f"  tool_calls={len(tool_calls)}")
 
         if not tool_calls:
+            if required_tool:
+                # Zincir tamamlanmadan modelin serbest cevap vermesine izin verme.
+                # tool_choice'a rağmen tool çağırmadıysa, zorlayarak tekrar iste.
+                # NOT: model küçük olduğu için burada verilecek talimat metnini bile
+                # kelimesi kelimesine tool parametresi olarak kopyalayabiliyor. Bu yüzden
+                # talimat yerine orijinal soruyu aynen tekrar ediyoruz.
+                if verbose:
+                    print(f"  !! ZORUNLU TOOL CAGRILMADI ({required_tool}), tekrar isteniyor")
+                messages.append({"role": "assistant", "content": msg.get("content") or ""})
+                messages.append({"role": "user", "content": question})
+                continue
             return msg.get("content", "")
 
-        # Modelin birden fazla tool çağırmasını engelle: sadece ilk geçerliyi al
+        # Modelin birden fazla tool çağırmasını engelle: sadece ilk geçerliyi al.
+        # Bir tool zorunluysa, sadece o isimdeki çağrıyı kabul et; diğerlerini yok say.
         valid_tc = None
         for tc in tool_calls:
             fn   = tc.get("function", {})
@@ -91,6 +134,10 @@ def run_query(question: str, verbose: bool = True) -> str:
                     args = json.loads(args)
                 except Exception:
                     args = {}
+            if required_tool and name != required_tool:
+                if verbose:
+                    print(f"  !! ATLANDI (sirasi degil, beklenen={required_tool}): {name}")
+                continue
             # Placeholder içeren çağrıları atla
             args_str = json.dumps(args)
             if "<doc_id>" in args_str or "<section>" in args_str:
@@ -110,9 +157,12 @@ def run_query(question: str, verbose: bool = True) -> str:
             break  # Sadece ilk geçerli tool çağrısını işle
 
         if valid_tc is None:
-            # Hiç geçerli tool yoksa modelden düz yanıt iste
+            # Hiç geçerli tool yoksa modelden aynı tool'u tekrar dene (zorunluysa) ya da serbest cevap iste
             messages.append({"role": "assistant", "content": msg.get("content") or ""})
-            messages.append({"role": "user", "content": "Elindeki bilgilerle Türkçe özet yanıt ver."})
+            if required_tool:
+                messages.append({"role": "user", "content": question})
+            else:
+                messages.append({"role": "user", "content": "Elindeki bilgilerle Türkçe özet yanıt ver."})
             continue
 
         tc, name, args = valid_tc
@@ -129,6 +179,17 @@ def run_query(question: str, verbose: bool = True) -> str:
             "role":    "tool",
             "content": json.dumps(result, ensure_ascii=False),
         })
+
+        # Zincir durumunu güncelle
+        if name == "get_master_index":
+            state["master_done"] = True
+        elif name == "search_decisions":
+            state["search_done"] = True
+            state["search_empty"] = result.get("toplam_eslesen", 0) == 0
+        elif name == "get_decision_structure" and "hata" not in result:
+            state["structure_done"] = True
+        elif name == "get_section" and "hata" not in result:
+            state["section_done"] = True
 
     return "Maksimum tur sayisina ulasildi."
 
