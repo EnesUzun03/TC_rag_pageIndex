@@ -186,6 +186,38 @@ def run_query(question: str, verbose: bool = True) -> str:
         elif name == "search_decisions":
             state["search_done"] = True
             state["search_empty"] = result.get("toplam_eslesen", 0) == 0
+
+            # Ollama'nin tool_choice zorlamasi sadece ilk turda guvenilir calisiyor;
+            # sonraki turlarda LLM zorlanan tool'u yok sayip eski tool'u tekrar cagirabiliyor
+            # (gozlemledigimiz sonsuz donguye yol acan davranis). Bu yuzden get_decision_structure
+            # adimini LLM'e sormadan biz burada dogrudan calistirip, sonucu LLM'in kendisi
+            # cagirmis gibi gorecegi bir mesaj olarak gecmise ekliyoruz.
+            if not state["search_empty"]:
+                sonuclar = result.get("kararlar", [])
+                if sonuclar:
+                    top_doc_id = sonuclar[0]["doc_id"]
+                    structure_result = dispatch("get_decision_structure", {"doc_id": top_doc_id})
+
+                    if verbose:
+                        print(f"  -> (otomatik) get_decision_structure({{'doc_id': '{top_doc_id}'}})")
+
+                    messages.append({
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{
+                            "function": {
+                                "name": "get_decision_structure",
+                                "arguments": {"doc_id": top_doc_id},
+                            }
+                        }],
+                    })
+                    messages.append({
+                        "role": "tool",
+                        "content": json.dumps(structure_result, ensure_ascii=False),
+                    })
+
+                    if "hata" not in structure_result:
+                        state["structure_done"] = True
         elif name == "get_decision_structure" and "hata" not in result:
             state["structure_done"] = True
         elif name == "get_section" and "hata" not in result:
