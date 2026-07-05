@@ -84,12 +84,18 @@ def search_decisions(dava_turu: str = "", keyword: str = "", limit: int = 15) ->
         if not turu_esles:
             continue  # dava türü uymuyorsa devam etmeye gerek yok, tam metin okumaktan kaçınırız
 
-        # Keyword'ün nerede eşleştiğine göre alaka skoru veriyoruz: hüküm en güçlü sinyal,
-        # sonra bölüm özetleri, en zayıfı da sadece tam metinde geçiyor olması.
+        # Keyword'ün nerede eşleştiğine göre alaka skoru veriyoruz: dava_turu alanında geçmesi
+        # en güçlü sinyal (davanın konusunu doğrudan tanımlıyor), sonra hüküm, sonra özetler,
+        # en zayıfı da sadece tam metinde geçiyor olması. Hüküm metnindeki kelime tek başına
+        # güvenilir değil - örn. "tazminat" kelimesi boilerplate ("kötü niyet tazminatı") olarak
+        # konuyla ilgisiz kararlarda da sıkça geçiyor, bu yüzden dava_turu eşleşmesi önceliğe alındı.
         keyword_esles = True
         relevans = 100 if (dava_turu and dava_turu_f == dt_f) else 0
         if keyword:
-            if keyword_f in _fold(huküm):
+            if keyword_f in dt_f:
+                relevans += 60
+                keyword_esles = True
+            elif keyword_f in _fold(huküm):
                 relevans += 50
                 keyword_esles = True
             elif keyword_f in _fold(ozet):
