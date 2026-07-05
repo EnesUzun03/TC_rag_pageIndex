@@ -6,6 +6,8 @@ ihtiyaç duyduğu bölümü getirir.
 
 import json
 import os
+import re
+from collections import Counter
 
 # Bu json içerisinde section özetleri isimleri ve offsetleri var 
 INDEX_FILE = "kararlar_index.json"
@@ -145,6 +147,88 @@ def search_decisions(dava_turu: str = "", keyword: str = "", limit: int = 15) ->
             ),
         }
     return {"toplam_eslesen": len(results), "kararlar": results}
+
+
+# ── Benzer dava bulma (avukatın anlattığı olaya en yakın kararlar) ─────────────
+# Bu kurumsal Türkçe hukuk metinlerinde neredeyse her belgede geçtiği için hiçbir
+# ayırt edici sinyal taşımayan, dolayısıyla anahtar kelime olarak elenmesi gereken kelimeler.
+_STOPWORDS = {
+    "ve", "ile", "veya", "ya", "da", "de", "bir", "bu", "şu", "o", "ki", "mı", "mi", "mu", "mü",
+    "için", "gibi", "olan", "olarak", "üzere", "ancak", "fakat", "ama", "çok", "daha", "en",
+    "ne", "kadar", "sonra", "önce", "göre", "arasında", "ise", "her", "hiç", "tarafından",
+    "aynı", "olup", "olduğu", "olduğunu", "edilen", "edilmiş", "yapılan", "üzerine", "diye",
+    "dava", "davacı", "davalı", "davacının", "davalının", "mahkeme", "mahkememiz", "karar",
+    "kararı", "hüküm", "gerekçe", "esas", "vekili", "yönünden", "hususunda", "nedeniyle",
+    "şekilde", "durumda", "birlikte", "diğer", "tüm", "söz", "konusu",
+}
+
+
+def _extract_keywords(text: str, top_n: int = 20) -> list[str]:
+    """Serbest metin (avukatın dava anlatımı) içinden anlamlı anahtar kelimeleri çıkarır.
+    Basit frekans sayımı: stopword'leri ve kısa kelimeleri eler, en sık geçen benzersiz
+    kelimeleri döndürür. Embedding kullanmadığımız için (vectorless yaklaşım) bu, metnin
+    "neyle ilgili olduğunu" temsil eden en kaba ama bağımsız sinyal."""
+    folded = _fold(text)
+    words = re.findall(r"[a-zçğıöşü]+", folded)
+    words = [w for w in words if len(w) > 3 and w not in _STOPWORDS]
+    counts = Counter(words)
+    return [w for w, _ in counts.most_common(top_n)]
+
+
+def find_similar_decisions(case_text: str, limit: int = 5) -> dict:
+    """
+    Avukatın serbest metinle anlattığı bir dava olayına en çok benzeyen kararları bulur.
+    search_decisions'daki tek-kelime aramasından farklı olarak, uzun bir anlatımdan çıkarılan
+    birden fazla anahtar kelimenin toplam eşleşme ağırlığına göre sıralama yapar.
+    """
+    idx = _load_index()
+    keywords = _extract_keywords(case_text)
+    if not keywords:
+        return {"toplam_eslesen": 0, "kararlar": [], "anahtar_kelimeler": []}
+
+    results = []
+    for doc in idx["docs"]:
+        dt_f = _fold(doc.get("dava_turu", ""))
+        huküm_f = _fold(doc.get("huküm_ozet", ""))
+        ozet_f = _fold(" ".join(doc.get("section_ozetleri", {}).values()))
+
+        score = 0
+        eslesen_kelimeler = []
+        for kw in keywords:
+            if kw in dt_f:
+                score += 6
+                eslesen_kelimeler.append(kw)
+            elif kw in huküm_f:
+                score += 3
+                eslesen_kelimeler.append(kw)
+            elif kw in ozet_f:
+                score += 1
+                eslesen_kelimeler.append(kw)
+
+        if score > 0:
+            results.append({
+                "doc_id":            doc["doc_id"],
+                "mahkeme":           doc.get("mahkeme", ""),
+                "dava_turu":         doc.get("dava_turu", ""),
+                "karar_tarihi":      doc.get("karar_tarihi", ""),
+                "esas_no":           doc.get("esas_no", ""),
+                "karar_no":          doc.get("karar_no", ""),
+                "sections":          doc.get("sections", []),
+                "huküm_ozet":        doc.get("huküm_ozet", "")[:200],
+                "eslesen_kelimeler": eslesen_kelimeler,
+                "_skor":             score,
+            })
+
+    results.sort(key=lambda r: r["_skor"], reverse=True)
+    results = results[:limit]
+    for r in results:
+        del r["_skor"]
+
+    return {
+        "toplam_eslesen": len(results),
+        "kararlar": results,
+        "anahtar_kelimeler": keywords,
+    }
 
 
 # ── Araç 3 ────────────────────────────────────────────────────────────────────
