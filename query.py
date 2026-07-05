@@ -62,6 +62,22 @@ def _required_tool(state: dict) -> str | None:
     return None  # zincir tamamlandı, artık serbest cevaba izin ver
 
 
+# Kaynak/atıf bilgisini cevabın sonuna kod tarafında ekliyoruz - LLM'e "kaynak belirt" demek
+# güvenilir değil (unutabilir/uydurabilir), bu yüzden hangi doc_id'den içerik okunduysa onun
+# esas_no/karar_no/mahkeme bilgisini burada deterministik olarak ekliyoruz.
+def _with_citation(answer: str, cited_doc_id: str | None, docs_meta: dict) -> str:
+    if not cited_doc_id or cited_doc_id not in docs_meta:
+        return answer
+    meta = docs_meta[cited_doc_id]
+    kaynak = (
+        f"\n\nKaynak: {meta.get('mahkeme', '?')} | "
+        f"Esas No: {meta.get('esas_no', '?')} | "
+        f"Karar No: {meta.get('karar_no', '?')} | "
+        f"Karar Tarihi: {meta.get('karar_tarihi', '?')}"
+    )
+    return answer + kaynak
+
+
 # Bu sistemin llm agent sistemiyle nasıl çalıştığına dair temel akış:
 def run_query(question: str, verbose: bool = True) -> str:
     messages = [
@@ -77,10 +93,58 @@ def run_query(question: str, verbose: bool = True) -> str:
         "structure_done": False,
         "section_done": False,
     }
+    # Atıf için: search_decisions'ın döndürdüğü karar meta bilgileri (esas_no, mahkeme, vb.)
+    # doc_id'ye göre saklanır. Cevap hangi doc_id'den üretildiyse (get_section'a bakılarak)
+    # kaynağı buradan çekip cevabın sonuna kod tarafında ekleyeceğiz - LLM'e güvenmiyoruz.
+    docs_meta = {}
+    cited_doc_id = None
+    top_doc_id = None  # search_decisions'ın seçtiği ana karar - get_section fallback'i için lazım
+
+    # Ayni zorunlu tool ust uste kac kez basarisiz oldu - Ollama'nin tool_choice zorlamasi
+    # bazen hicbir sekilde ise yaramiyor (model israrla baska bir tool cagiriyor), bu durumda
+    # sonsuz donguye girmemek icin belirli bir esikten sonra adimi kendimiz calistiracagiz.
+    stuck_tool = None
+    stuck_count = 0
 
     # Bu döngü agent sistem döngüsü gibi düşünülebilir burada metodları çağırır ve sonuçları LLM'e geri veririz.
     for round_num in range(MAX_ROUNDS):
         required_tool = _required_tool(state)
+
+        if required_tool == stuck_tool:
+            stuck_count += 1
+        else:
+            stuck_tool = required_tool
+            stuck_count = 0
+
+        # get_section'da 2 turdur takılı kaldıysak, modele sormayı bırakıp kendimiz
+        # varsayılan bir bölümle (tercihen "huküm") çağırıp zinciri kapatıyoruz.
+        if required_tool == "get_section" and stuck_count >= 2 and top_doc_id:
+            structure = docs_meta.get(top_doc_id, {})
+            bolumler = structure.get("mevcut_bolumler", [])
+            section = "huküm" if "huküm" in bolumler else (bolumler[0] if bolumler else None)
+            if section:
+                if verbose:
+                    print(f"\n[Tur {round_num + 1}] !! GET_SECTION'DA TAKILDI, otomatik cagriliyor: "
+                          f"get_section(doc_id={top_doc_id}, section={section})")
+                section_result = dispatch("get_section", {"doc_id": top_doc_id, "section": section})
+                messages.append({
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "function": {
+                            "name": "get_section",
+                            "arguments": {"doc_id": top_doc_id, "section": section},
+                        }
+                    }],
+                })
+                messages.append({
+                    "role": "tool",
+                    "content": json.dumps(section_result, ensure_ascii=False),
+                })
+                if "hata" not in section_result:
+                    state["section_done"] = True
+                    cited_doc_id = section_result.get("doc_id")
+                continue
 
         #Ollama API request body.
         payload = {
@@ -120,7 +184,7 @@ def run_query(question: str, verbose: bool = True) -> str:
                 messages.append({"role": "assistant", "content": msg.get("content") or ""})
                 messages.append({"role": "user", "content": question})
                 continue
-            return msg.get("content", "")
+            return _with_citation(msg.get("content", ""), cited_doc_id, docs_meta)
 
         # Modelin birden fazla tool çağırmasını engelle: sadece ilk geçerliyi al.
         # Bir tool zorunluysa, sadece o isimdeki çağrıyı kabul et; diğerlerini yok say.
@@ -187,6 +251,10 @@ def run_query(question: str, verbose: bool = True) -> str:
             state["search_done"] = True
             state["search_empty"] = result.get("toplam_eslesen", 0) == 0
 
+            # Atıf için karar meta bilgilerini sakla (doc_id -> esas_no/mahkeme/karar_tarihi)
+            for d in result.get("kararlar", []):
+                docs_meta[d["doc_id"]] = d
+
             # Ollama'nin tool_choice zorlamasi sadece ilk turda guvenilir calisiyor;
             # sonraki turlarda LLM zorlanan tool'u yok sayip eski tool'u tekrar cagirabiliyor
             # (gozlemledigimiz sonsuz donguye yol acan davranis). Bu yuzden get_decision_structure
@@ -195,7 +263,7 @@ def run_query(question: str, verbose: bool = True) -> str:
             if not state["search_empty"]:
                 sonuclar = result.get("kararlar", [])
                 if sonuclar:
-                    top_doc_id = sonuclar[0]["doc_id"]
+                    top_doc_id = sonuclar[0]["doc_id"]  # dış kapsamdaki değişkeni güncelle
                     structure_result = dispatch("get_decision_structure", {"doc_id": top_doc_id})
 
                     if verbose:
@@ -218,12 +286,14 @@ def run_query(question: str, verbose: bool = True) -> str:
 
                     if "hata" not in structure_result:
                         state["structure_done"] = True
+                        docs_meta[top_doc_id] = structure_result  # karar_no dahil tam meta
         elif name == "get_decision_structure" and "hata" not in result:
             state["structure_done"] = True
         elif name == "get_section" and "hata" not in result:
             state["section_done"] = True
+            cited_doc_id = result.get("doc_id")  # cevabın gerçekten hangi karardan üretildiği
 
-    return "Maksimum tur sayisina ulasildi."
+    return _with_citation("Maksimum tur sayisina ulasildi.", cited_doc_id, docs_meta)
 
 
 def main():

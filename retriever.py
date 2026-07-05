@@ -13,6 +13,22 @@ KARARLAR_DIR = "kararlar"
 
 _index_cache = None
 
+# LLM bazen Türkçe kelimeleri aksansız yazıyor ("ortakliktan cikma" vs "Ortaklıktan Çıkma").
+# str.lower() bu karakterleri eşitlemediği için ("ı" != "i", "ç" != "c") aramalar sessizce 0 sonuç
+# döndürebiliyor. Karşılaştırma öncesi hem sorguyu hem metni bu tabloyla sadeleştiriyoruz.
+_TR_FOLD = str.maketrans({
+    "ı": "i", "İ": "i", "I": "i",
+    "ğ": "g", "Ğ": "g",
+    "ü": "u", "Ü": "u",
+    "ş": "s", "Ş": "s",
+    "ö": "o", "Ö": "o",
+    "ç": "c", "Ç": "c",
+})
+
+
+def _fold(text: str) -> str:
+    return text.lower().translate(_TR_FOLD)
+
 # Burada json'u ram'e yükleyip cache'liyoruz, böylece her araç çağrısında diske gitmek zorunda kalmayız.
 def _load_index() -> dict:
     global _index_cache
@@ -48,33 +64,49 @@ def search_decisions(dava_turu: str = "", keyword: str = "", limit: int = 15) ->
     idx = _load_index()
     limit = int(limit)  # LLM bazen sayıyı string olarak gönderiyor ("15")
     # dava_turu gerçekten index'te var mı kontrol et; yoksa yoksay
+    dava_turu_f = _fold(dava_turu)
     if dava_turu:
-        turu_var = any(dava_turu.lower() in k.lower() for k in idx["by_dava_turu"])
+        turu_var = any(dava_turu_f in _fold(k) for k in idx["by_dava_turu"])
         if not turu_var:
             dava_turu = ""  # index'te olmayan bir tür → keyword-only moda geç
+            dava_turu_f = ""
 
+    keyword_f = _fold(keyword)
     results = []
     for doc in idx["docs"]:
         dt = doc.get("dava_turu", "") # dava türlerini çek
         huküm = doc.get("huküm_ozet", "")
         ozet = " ".join(doc.get("section_ozetleri", {}).values())
+        dt_f = _fold(dt)
 
         #Eğer dava türü verilmişse kontrol et.
-        turu_esles = dava_turu.lower() in dt.lower() if dava_turu else True
+        turu_esles = dava_turu_f in dt_f if dava_turu else True
+        if not turu_esles:
+            continue  # dava türü uymuyorsa devam etmeye gerek yok, tam metin okumaktan kaçınırız
 
-        if keyword and not keyword.lower() in (dt + huküm + ozet).lower(): # Önce dava türü, hüküm özeti ve bölüm özetlerinde ara
-            # Özette bulunamazsa tam metni ara
-            path = os.path.join(KARARLAR_DIR, doc["dosya"])
-            try:
-                with open(path, encoding="utf-8") as f:
-                    full_text = f.read()
-                keyword_esles = keyword.lower() in full_text.lower() # Full arama yap
-            except Exception:
-                keyword_esles = False
-        elif keyword:
-            keyword_esles = True
+        # Keyword'ün nerede eşleştiğine göre alaka skoru veriyoruz: hüküm en güçlü sinyal,
+        # sonra bölüm özetleri, en zayıfı da sadece tam metinde geçiyor olması.
+        keyword_esles = True
+        relevans = 100 if (dava_turu and dava_turu_f == dt_f) else 0
+        if keyword:
+            if keyword_f in _fold(huküm):
+                relevans += 50
+                keyword_esles = True
+            elif keyword_f in _fold(ozet):
+                relevans += 20
+                keyword_esles = True
+            else:
+                path = os.path.join(KARARLAR_DIR, doc["dosya"])
+                try:
+                    with open(path, encoding="utf-8") as f:
+                        full_text = f.read()
+                    keyword_esles = keyword_f in _fold(full_text)
+                    if keyword_esles:
+                        relevans += 5
+                except Exception:
+                    keyword_esles = False
         else:
-            keyword_esles = True
+            relevans += 10  # keyword yok, sadece dava_turu filtresiyle geldi
 
         if turu_esles and keyword_esles: # her ikisinde sağlıyorsa sonuçlara ekle
             results.append({
@@ -83,11 +115,17 @@ def search_decisions(dava_turu: str = "", keyword: str = "", limit: int = 15) ->
                 "dava_turu":    dt,
                 "karar_tarihi": doc.get("karar_tarihi", ""),
                 "esas_no":      doc.get("esas_no", ""),
+                "karar_no":     doc.get("karar_no", ""),
                 "sections":     doc.get("sections", []),
                 "huküm_ozet":   huküm[:200],
+                "_relevans":    relevans,
             })
-        if len(results) >= limit:
-            break
+
+    # En alakalı sonuçlar başta olacak şekilde sırala, sonra limitle kes
+    results.sort(key=lambda r: r["_relevans"], reverse=True)
+    results = results[:limit]
+    for r in results:
+        del r["_relevans"]  # LLM'e gereksiz iç detay gitmesin
 
     if not results:
         return {
