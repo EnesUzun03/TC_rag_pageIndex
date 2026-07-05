@@ -34,23 +34,31 @@ MODEL = "llama3.1:8b"
 
 _JUSTIFY_SYSTEM = (
     "Sen bir Turk hukuku asistanisin. Sana bir avukatin anlattigi olay ile veri "
-    "tabanindaki bir mahkeme kararinin ozeti verilecek. Gorevin: bu kararin anlatilan "
-    "olaya NEDEN benzedigini 2-3 cumleyle Turkce acikla. Sadece sana verilen bilgilere "
-    "dayan, kararda veya olayda gecmeyen hicbir detay uydurma. Eger gercekte zayif bir "
-    "benzerlik varsa bunu da acikca belirt."
+    "tabanindaki bir mahkeme kararinin dava dilekcesi ve hukmu verilecek. Gorevin: bu "
+    "kararin anlatilan olaya hukuki acidan NEDEN benzedigini 3-4 cumleyle Turkce acikla.\n\n"
+    "ODAKLANMAN GEREKENLER:\n"
+    "- Hukuki iliskinin turu ve dayanagi (orn. ortaklıktan cikma/cikarma, haklı sebep, "
+    "TTK/TBK maddeleri, talep edilen hukuki sonuc)\n"
+    "- Taraflarin hukuki konumu ve uyusmazligin ozu (kim, kimden, neden, ne talep ediyor)\n"
+    "- Kararda verilen hukuki sonucun anlatilan olaydaki talep ile ne olcude ortustugu\n\n"
+    "KESINLIKLE YAPMA: Sadece ortak kelime kullanimindan bahsetme ('ortaklik', 'sirket' gibi "
+    "kelimeler her iki metinde de geciyor demek yetmez). Yuzeysel kelime benzerligi degil, "
+    "hukuki iliskinin ozdesligini veya farkliligini analiz et. Sadece sana verilen bilgilere "
+    "dayan, uydurma detay ekleme. Eger hukuki acidan zayif bir benzerlik varsa bunu acikca belirt."
 )
 
 
-def _llm_justification(case_text: str, karar: dict) -> str:
+def _llm_justification(case_text: str, karar: dict, dava_excerpt: str = "") -> str:
     """Verilen karar ile anlatilan olayin neden benzedigini LLM'e tek seferlik, duz bir
-    tamamlama istegiyle acikliyoruz (tool cagirma yok, bu yuzden guvenilirligi yuksek)."""
+    tamamlama istegiyle acikliyoruz (tool cagirma yok, bu yuzden guvenilirligi yuksek).
+    Not: eslesen anahtar kelimeleri BILEREK prompta vermiyoruz - model bunlari gorunce
+    hukuki analiz yerine kelime eslestirmesine kayiyordu (gozlemlenen davranis)."""
     prompt = (
         f"ANLATILAN OLAY:\n{case_text.strip()}\n\n"
-        f"KARAR OZETI:\n"
-        f"Dava Turu: {karar.get('dava_turu', '')}\n"
-        f"Hukum Ozeti: {karar.get('huküm_ozet', '')}\n"
-        f"Eslesen anahtar kelimeler: {', '.join(karar.get('eslesen_kelimeler', []))}\n\n"
-        f"Bu karar neden anlatilan olaya benziyor? Kisa ve net acikla."
+        f"KARARIN DAVA TURU: {karar.get('dava_turu', '')}\n\n"
+        f"KARARIN DAVA DILEKCESI (ozet):\n{dava_excerpt[:2000] or '(mevcut degil)'}\n\n"
+        f"KARARIN HUKMU:\n{karar.get('huküm_ozet', '')}\n\n"
+        f"Bu karar anlatilan olaya hukuki acidan neden benziyor (veya benzemiyor)? Kisa ve net acikla."
     )
     try:
         resp = requests.post(
@@ -155,23 +163,31 @@ def build_pdf(case_text: str, output_path: str, limit: int = 5, with_llm: bool =
             )
             story.append(Paragraph(meta, styles["meta"]))
 
-            if with_llm:
-                print(f"  [{i}/{len(kararlar)}] LLM'den benzerlik gerekçesi isteniyor "
-                      f"({karar['doc_id']})...")
-                justification = _llm_justification(case_text, karar)
-                story.append(_p("Neden Benzer? (LLM Değerlendirmesi)", styles["section_header"]))
-                story.append(_p(justification, styles["body"]))
-
+            # Bölüm metinlerini önce tek seferde çekiyoruz - hem LLM gerekçesinde
+            # (dava dilekçesi özeti olarak) hem de PDF'e tam metin basarken kullanılacak.
             doc_id = karar["doc_id"]
+            section_texts = {}
             for section_key in SECTION_ORDER:
                 if section_key not in karar.get("sections", []):
                     continue
                 section_result = get_section(doc_id, section_key)
-                if "hata" in section_result:
+                if "hata" not in section_result:
+                    section_texts[section_key] = section_result["content"]
+
+            if with_llm:
+                print(f"  [{i}/{len(kararlar)}] LLM'den benzerlik gerekçesi isteniyor "
+                      f"({doc_id})...")
+                dava_excerpt = section_texts.get("dava", "")
+                justification = _llm_justification(case_text, karar, dava_excerpt)
+                story.append(_p("Neden Benzer? (LLM Değerlendirmesi)", styles["section_header"]))
+                story.append(_p(justification, styles["body"]))
+
+            for section_key in SECTION_ORDER:
+                if section_key not in section_texts:
                     continue
                 story.append(_p(SECTION_LABELS.get(section_key, section_key.upper()),
                                  styles["section_header"]))
-                story.append(_p(section_result["content"], styles["body"]))
+                story.append(_p(section_texts[section_key], styles["body"]))
 
     doc = SimpleDocTemplate(
         output_path, pagesize=A4,
