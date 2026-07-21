@@ -73,6 +73,22 @@ def search_decisions(dava_turu: str = "", keyword: str = "", limit: int = 15) ->
             dava_turu = ""  # index'te olmayan bir tür → keyword-only moda geç
             dava_turu_f = ""
 
+    # dava_turu gecersiz cikip keyword de bossa elimizde hicbir filtre kalmiyor demektir.
+    # Bu durumda TUM kararlar ayni (relevans=10) skoru alip index sirasina gore ilk `limit`
+    # tanesi rastgele secilmis gibi donuyordu - LLM alakasiz bir karari "en iyi eslesme"
+    # sanip context'e aliyor, sonra da bu alakasiz metni gormezden gelip halisunasyonlu bir
+    # cevap uretiyordu (gozlemlenen davranis). Anlamli bir filtre yoksa acikca "bulunamadi" don.
+    if not dava_turu and not keyword:
+        return {
+            "toplam_eslesen": 0,
+            "kararlar": [],
+            "uyari": (
+                "Ne dava_turu ne de keyword belirtildi (ya da dava_turu veri tabaninda "
+                "bulunamadi). Anlamli bir sonuc donebilmek icin get_master_index'te GERCEKTEN "
+                "goruneun bir dava_turu ya da sorudaki gercek bir kelimeyi keyword olarak kullan."
+            ),
+        }
+
     keyword_f = _fold(keyword)
     results = []
     for doc in idx["docs"]:
