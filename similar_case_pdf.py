@@ -13,7 +13,10 @@ import sys
 from datetime import datetime
 from xml.sax.saxutils import escape
 
-import requests
+from dotenv import load_dotenv
+load_dotenv()
+
+from groq import Groq
 
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle
@@ -29,8 +32,8 @@ from retriever import find_similar_decisions, get_section
 # yanlis parametre uretimi vb.) hep modelin "hangi arac cagrilacak" kararini vermesinden
 # kaynaklaniyordu. Burada boyle bir karar yok - sadece verilen ozet metne dayanarak
 # aciklama yazmasi isteniyor, bu yuzden cok daha guvenilir calisir.
-OLLAMA_URL = "http://localhost:11434/api/chat"
-MODEL = "llama3.1:8b"
+client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+MODEL = "llama-3.3-70b-versatile"
 
 _JUSTIFY_SYSTEM = (
     "Sen bir Turk hukuku asistanisin. Sana bir avukatin anlattigi olay ile veri "
@@ -61,20 +64,14 @@ def _llm_justification(case_text: str, karar: dict, dava_excerpt: str = "") -> s
         f"Bu karar anlatilan olaya hukuki acidan neden benziyor (veya benzemiyor)? Kisa ve net acikla."
     )
     try:
-        resp = requests.post(
-            OLLAMA_URL,
-            json={
-                "model": MODEL,
-                "messages": [
-                    {"role": "system", "content": _JUSTIFY_SYSTEM},
-                    {"role": "user", "content": prompt},
-                ],
-                "stream": False,
-            },
-            timeout=120,
+        resp = client.chat.completions.create(
+            model=MODEL,
+            messages=[
+                {"role": "system", "content": _JUSTIFY_SYSTEM},
+                {"role": "user", "content": prompt},
+            ],
         )
-        resp.raise_for_status()
-        content = resp.json().get("message", {}).get("content", "").strip()
+        content = (resp.choices[0].message.content or "").strip()
         return content or "(LLM boş yanıt döndürdü)"
     except Exception as e:
         return f"(LLM değerlendirmesi alınamadı: {e})"

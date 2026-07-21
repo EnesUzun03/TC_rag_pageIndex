@@ -1,10 +1,15 @@
 """
-PageIndex tabanlı hukuk RAG — Ollama / llama3.1:8b sorgu arayüzü.
+PageIndex tabanlı hukuk RAG — Groq / llama-3.3-70b-versatile sorgu arayüzü.
 """
 
+import os
 import sys
 import json
-import requests
+
+from dotenv import load_dotenv
+load_dotenv()
+
+from groq import Groq
 
 # Windows konsolunda UTF-8 zorla
 if sys.stdout.encoding != "utf-8":
@@ -12,9 +17,8 @@ if sys.stdout.encoding != "utf-8":
 
 from retriever import TOOLS, dispatch # TOOLS LLM'e verilecek tool tanımları, dispatch ise çağrılan tool'ları çalıştıracak fonksiyon.
 
-# Ollama local API endpointi ve model adı
-OLLAMA_URL = "http://localhost:11434/api/chat"
-MODEL      = "llama3.1:8b"
+client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+MODEL      = "llama-3.3-70b-versatile"
 MAX_ROUNDS = 8
 
 SYSTEM = """Sen bir Turk hukuku asistanisin. Elinde mahkeme kararlarindan olusan bir veri tabani var.
@@ -30,9 +34,8 @@ ZORUNLU SIRALAMA:
 
 KRITIK: dava_turu parametresine sadece get_master_index sonucunda GERCEKTEN GORUNEN bir degeri yaz. Yoksa bos birak."""
 
-# Ollama tool schema biraz farklı — "parameters" yerine "input_schema" değil,
-# OpenAI uyumlu format kullanıyor.
-def _to_ollama_tools(tools: list) -> list:
+# Groq, OpenAI uyumlu tool schema kullanıyor — "input_schema" yerine "parameters".
+def _to_groq_tools(tools: list) -> list:
     result = []
     for t in tools:
         result.append({
@@ -46,7 +49,7 @@ def _to_ollama_tools(tools: list) -> list:
     return result
 
 # PageIndex zincirinin zorunlu sırası. Model bu sırayı atlayıp erken cevap veremesin diye
-# her turda hangi tool'un çağrılabileceğini biz belirliyoruz (Ollama'nın tool_choice'una güvenmek
+# her turda hangi tool'un çağrılabileceğini biz belirliyoruz (LLM'in tool_choice'una güvenmek
 # yeterli değil - serbest bırakılınca model 2. turda hiç tool çağırmadan halüsinasyon üretiyordu).
 def _required_tool(state: dict) -> str | None:
     if not state["master_done"]:
@@ -84,7 +87,7 @@ def run_query(question: str, verbose: bool = True) -> str:
         {"role": "system",  "content": SYSTEM}, # LLM'e gönderilen Başlangıç context'i System prompt'u ve kullanıcı sorusu User mesajı olarak başlar.
         {"role": "user",    "content": question},
     ]
-    ollama_tools = _to_ollama_tools(TOOLS) # LLM'e TOOL setini verdik
+    groq_tools = _to_groq_tools(TOOLS) # LLM'e TOOL setini verdik
 
     state = {
         "master_done": False,
@@ -100,7 +103,7 @@ def run_query(question: str, verbose: bool = True) -> str:
     cited_doc_id = None
     top_doc_id = None  # search_decisions'ın seçtiği ana karar - get_section fallback'i için lazım
 
-    # Ayni zorunlu tool ust uste kac kez basarisiz oldu - Ollama'nin tool_choice zorlamasi
+    # Ayni zorunlu tool ust uste kac kez basarisiz oldu - LLM'in tool_choice zorlamasi
     # bazen hicbir sekilde ise yaramiyor (model israrla baska bir tool cagiriyor), bu durumda
     # sonsuz donguye girmemek icin belirli bir esikten sonra adimi kendimiz calistiracagiz.
     stuck_tool = None
@@ -127,18 +130,22 @@ def run_query(question: str, verbose: bool = True) -> str:
                     print(f"\n[Tur {round_num + 1}] !! GET_SECTION'DA TAKILDI, otomatik cagriliyor: "
                           f"get_section(doc_id={top_doc_id}, section={section})")
                 section_result = dispatch("get_section", {"doc_id": top_doc_id, "section": section})
+                auto_call_id = f"call_auto_get_section_{round_num}"
                 messages.append({
                     "role": "assistant",
                     "content": "",
                     "tool_calls": [{
+                        "id": auto_call_id,
+                        "type": "function",
                         "function": {
                             "name": "get_section",
-                            "arguments": {"doc_id": top_doc_id, "section": section},
+                            "arguments": json.dumps({"doc_id": top_doc_id, "section": section}, ensure_ascii=False),
                         }
                     }],
                 })
                 messages.append({
                     "role": "tool",
+                    "tool_call_id": auto_call_id,
                     "content": json.dumps(section_result, ensure_ascii=False),
                 })
                 if "hata" not in section_result:
@@ -146,15 +153,14 @@ def run_query(question: str, verbose: bool = True) -> str:
                     cited_doc_id = section_result.get("doc_id")
                 continue
 
-        #Ollama API request body.
-        payload = {
+        # Groq API cagrisi (OpenAI uyumlu chat.completions).
+        create_kwargs = {
             "model":    MODEL,
             "messages": messages,
-            "tools":    ollama_tools,
-            "stream":   False,
+            "tools":    groq_tools,
         }
         if required_tool:
-            payload["tool_choice"] = {
+            create_kwargs["tool_choice"] = {
                 "type": "function",
                 "function": {"name": required_tool}
             }
@@ -162,12 +168,9 @@ def run_query(question: str, verbose: bool = True) -> str:
         if verbose:
             print(f"\n[Tur {round_num + 1}] zorunlu_tool={required_tool or '(serbest)'}")
 
-        resp = requests.post(OLLAMA_URL, json=payload, timeout=300)
-        resp.raise_for_status()
-        data = resp.json()
-
-        msg = data.get("message", {})
-        tool_calls = msg.get("tool_calls", [])
+        resp = client.chat.completions.create(**create_kwargs)
+        msg = resp.choices[0].message
+        tool_calls = msg.tool_calls or []
 
         if verbose:
             print(f"  tool_calls={len(tool_calls)}")
@@ -181,18 +184,17 @@ def run_query(question: str, verbose: bool = True) -> str:
                 # talimat yerine orijinal soruyu aynen tekrar ediyoruz.
                 if verbose:
                     print(f"  !! ZORUNLU TOOL CAGRILMADI ({required_tool}), tekrar isteniyor")
-                messages.append({"role": "assistant", "content": msg.get("content") or ""})
+                messages.append({"role": "assistant", "content": msg.content or ""})
                 messages.append({"role": "user", "content": question})
                 continue
-            return _with_citation(msg.get("content", ""), cited_doc_id, docs_meta)
+            return _with_citation(msg.content or "", cited_doc_id, docs_meta)
 
         # Modelin birden fazla tool çağırmasını engelle: sadece ilk geçerliyi al.
         # Bir tool zorunluysa, sadece o isimdeki çağrıyı kabul et; diğerlerini yok say.
         valid_tc = None
         for tc in tool_calls:
-            fn   = tc.get("function", {})
-            name = fn.get("name", "")
-            args = fn.get("arguments", {})
+            name = tc.function.name
+            args = tc.function.arguments
             if isinstance(args, str):
                 try:
                     args = json.loads(args)
@@ -222,7 +224,7 @@ def run_query(question: str, verbose: bool = True) -> str:
 
         if valid_tc is None:
             # Hiç geçerli tool yoksa modelden aynı tool'u tekrar dene (zorunluysa) ya da serbest cevap iste
-            messages.append({"role": "assistant", "content": msg.get("content") or ""})
+            messages.append({"role": "assistant", "content": msg.content or ""})
             if required_tool:
                 messages.append({"role": "user", "content": question})
             else:
@@ -232,7 +234,12 @@ def run_query(question: str, verbose: bool = True) -> str:
         tc, name, args = valid_tc
 
         # Assistant mesajını geçmişe ekle (sadece geçerli 1 tool ile)
-        messages.append({"role": "assistant", "content": msg.get("content") or "", "tool_calls": [tc]})
+        tc_dict = {
+            "id": tc.id,
+            "type": "function",
+            "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
+        }
+        messages.append({"role": "assistant", "content": msg.content or "", "tool_calls": [tc_dict]})
 
         if verbose:
             print(f"  -> {name}({json.dumps(args, ensure_ascii=True)[:100]})")
@@ -241,6 +248,7 @@ def run_query(question: str, verbose: bool = True) -> str:
 
         messages.append({
             "role":    "tool",
+            "tool_call_id": tc.id,
             "content": json.dumps(result, ensure_ascii=False),
         })
 
@@ -255,7 +263,7 @@ def run_query(question: str, verbose: bool = True) -> str:
             for d in result.get("kararlar", []):
                 docs_meta[d["doc_id"]] = d
 
-            # Ollama'nin tool_choice zorlamasi sadece ilk turda guvenilir calisiyor;
+            # LLM'in tool_choice zorlamasi sadece ilk turda guvenilir calisiyor;
             # sonraki turlarda LLM zorlanan tool'u yok sayip eski tool'u tekrar cagirabiliyor
             # (gozlemledigimiz sonsuz donguye yol acan davranis). Bu yuzden get_decision_structure
             # adimini LLM'e sormadan biz burada dogrudan calistirip, sonucu LLM'in kendisi
@@ -269,18 +277,22 @@ def run_query(question: str, verbose: bool = True) -> str:
                     if verbose:
                         print(f"  -> (otomatik) get_decision_structure({{'doc_id': '{top_doc_id}'}})")
 
+                    auto_call_id = f"call_auto_get_decision_structure_{round_num}"
                     messages.append({
                         "role": "assistant",
                         "content": "",
                         "tool_calls": [{
+                            "id": auto_call_id,
+                            "type": "function",
                             "function": {
                                 "name": "get_decision_structure",
-                                "arguments": {"doc_id": top_doc_id},
+                                "arguments": json.dumps({"doc_id": top_doc_id}, ensure_ascii=False),
                             }
                         }],
                     })
                     messages.append({
                         "role": "tool",
+                        "tool_call_id": auto_call_id,
                         "content": json.dumps(structure_result, ensure_ascii=False),
                     })
 
@@ -300,7 +312,7 @@ def main():
     if len(sys.argv) > 1:
         question = " ".join(sys.argv[1:])
     else:
-        print("Hukuk Karar Asistani (PageIndex + Ollama llama3.1:8b)")
+        print("Hukuk Karar Asistani (PageIndex + Groq llama-3.3-70b-versatile)")
         print("Cikmak icin 'q' yazin.\n")
         question = input("Sorunuzu yazin: ").strip()
 
