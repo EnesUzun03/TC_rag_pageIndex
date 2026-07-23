@@ -146,7 +146,7 @@ def run_query(question: str, verbose: bool = True) -> str:
                 messages.append({
                     "role": "tool",
                     "tool_call_id": auto_call_id,
-                    "content": json.dumps(section_result, ensure_ascii=False),
+                    "content": json.dumps(section_result, ensure_ascii=False, separators=(",", ":")),
                 })
                 if "hata" not in section_result:
                     state["section_done"] = True
@@ -249,7 +249,7 @@ def run_query(question: str, verbose: bool = True) -> str:
         messages.append({
             "role":    "tool",
             "tool_call_id": tc.id,
-            "content": json.dumps(result, ensure_ascii=False),
+            "content": json.dumps(result, ensure_ascii=False, separators=(",", ":")),
         })
 
         # Zincir durumunu güncelle
@@ -293,7 +293,7 @@ def run_query(question: str, verbose: bool = True) -> str:
                     messages.append({
                         "role": "tool",
                         "tool_call_id": auto_call_id,
-                        "content": json.dumps(structure_result, ensure_ascii=False),
+                        "content": json.dumps(structure_result, ensure_ascii=False, separators=(",", ":")),
                     })
 
                     if "hata" not in structure_result:

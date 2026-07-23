@@ -50,18 +50,35 @@ def get_master_index() -> dict:
     """
     idx = _load_index()
     dava_turu_counts = {k: len(v) for k, v in idx["by_dava_turu"].items()} # Her dava türünde kaç karar var? k dava türü v sayısı {"Tazminat": 120, "Boşanma": 80, ...}
+
+    # Veri tabanında 288 farklı dava_turu var ve bunların ~2/3'ü sadece 1 kararda geçen
+    # nadir/uzun-kuyruk kategoriler. Hepsini LLM'e tam JSON olarak basmak (özellikle Groq'un
+    # ücretsiz TPM limitli tier'larında) context'i gereksiz şişiriyordu - search_decisions zaten
+    # eşleşmeyen/bilinmeyen bir dava_turu'nu sessizce keyword-only moda düşürüyor (bkz. o fonksiyon),
+    # bu yüzden nadir kategorileri listeden çıkarmak arama doğruluğunu bozmuyor.
+    MIN_COUNT = 2
+    sik_gorulen = {k: v for k, v in dava_turu_counts.items() if v >= MIN_COUNT}
+    nadir_kategori_sayisi = len(dava_turu_counts) - len(sik_gorulen)
+    nadir_karar_sayisi = sum(v for v in dava_turu_counts.values() if v < MIN_COUNT)
+
     return {
         "toplam_karar": len(idx["docs"]),
         "dava_turu_sayisi": len(idx["by_dava_turu"]),
-        "dava_turu_ve_adet": dava_turu_counts,
+        "dava_turu_ve_adet": sik_gorulen,
+        "not": (
+            f"Bunlara ek olarak, her biri sadece {MIN_COUNT - 1} kararda geçen "
+            f"{nadir_kategori_sayisi} nadir dava_turu daha var (toplam {nadir_karar_sayisi} karar). "
+            "Sorudaki konu yukarıdaki listede AYNEN geçmiyorsa, dava_turu'nu bos birak ve "
+            "search_decisions'i keyword ile çağır - nadir kategoriler de keyword aramasında bulunur."
+        ),
     }
 
 
 # ── Araç 2 ────────────────────────────────────────────────────────────────────
 # LLm'in belirli bir dava türünde veya anahtar kelimeyle karar araması yapmasını sağlar. get_master_index'ten öğrendiği dava türlerini kullanarak arama yapabilir.
-def search_decisions(dava_turu: str = "", keyword: str = "", limit: int = 15) -> dict:
+def search_decisions(dava_turu: str = "", keyword: str = "", limit: int = 8) -> dict:
     """
-    Dava türü veya anahtar kelimeye göre karar listesi döndürür (max 15 sonuç).
+    Dava türü veya anahtar kelimeye göre karar listesi döndürür (max 8 sonuç).
     """
     idx = _load_index()
     limit = int(limit)  # LLM bazen sayıyı string olarak gönderiyor ("15")
@@ -133,6 +150,8 @@ def search_decisions(dava_turu: str = "", keyword: str = "", limit: int = 15) ->
             relevans += 10  # keyword yok, sadece dava_turu filtresiyle geldi
 
         if turu_esles and keyword_esles: # her ikisinde sağlıyorsa sonuçlara ekle
+            # "sections" burada kasten yok - get_decision_structure zaten seçilen doc_id için
+            # bunu taze getiriyor, arama sonucunda tekrarlamak sadece token israfi.
             results.append({
                 "doc_id":       doc["doc_id"],
                 "mahkeme":      doc.get("mahkeme", ""),
@@ -140,7 +159,6 @@ def search_decisions(dava_turu: str = "", keyword: str = "", limit: int = 15) ->
                 "karar_tarihi": doc.get("karar_tarihi", ""),
                 "esas_no":      doc.get("esas_no", ""),
                 "karar_no":     doc.get("karar_no", ""),
-                "sections":     doc.get("sections", []),
                 "huküm_ozet":   huküm[:200],
                 "_relevans":    relevans,
             })
@@ -322,7 +340,7 @@ TOOLS = [
     {
         "name": "search_decisions",
         "description": (
-            "Dava türü veya anahtar kelimeye göre karar arar, max 15 sonuç döndürür. "
+            "Dava türü veya anahtar kelimeye göre karar arar, max 8 sonuç döndürür. "
             "get_master_index'ten dava türünü öğrendikten sonra bu araçla ilgili kararları bul."
         ),
         "input_schema": {
@@ -338,7 +356,7 @@ TOOLS = [
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Maksimum sonuç sayısı (varsayılan 15)",
+                    "description": "Maksimum sonuç sayısı (varsayılan 8)",
                 },
             },
             "required": [],
